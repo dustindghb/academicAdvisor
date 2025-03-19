@@ -1,0 +1,2 @@
+sudo docker start 3d0a58ccd2ed
+sudo docker exec -it ollama ollama list
