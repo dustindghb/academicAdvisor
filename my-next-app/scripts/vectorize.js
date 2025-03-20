@@ -1,5 +1,5 @@
-// optimized-vectorize.js
-// Fast and concise script for vectorizing bulletin files
+// semantic-vectorize.js
+// Enhanced script for semantically vectorizing bulletin files
 const { ChromaClient } = require('chromadb');
 const fs = require('fs');
 const path = require('path');
@@ -9,9 +9,8 @@ const CHROMA_URL = 'http://192.168.0.105:8000';
 const EMBED_API_URL = 'http://192.168.0.105:11434/api/embeddings';
 const COLLECTION_NAME = 'scu_bulletins';
 const EMBED_MODEL = 'nomic-embed-text:latest';
-const CHUNK_SIZE = 500;
-const DELAY_MS = 150; // Reduced delay for faster processing
-const CONCURRENT_FILES = 3; // Process multiple files concurrently
+const DELAY_MS = 150;
+const CONCURRENT_FILES = 3;
 
 // Clean text for embedding
 function cleanText(text) {
@@ -36,18 +35,109 @@ async function getEmbedding(text) {
   return (await response.json()).embedding;
 }
 
-// Split text into chunks efficiently
-function splitIntoChunks(text, chunkSize) {
-  const chunks = [];
-  const cleanedText = cleanText(text);
+// Extract metadata from chunk content
+function extractMetadata(chunk, fileName) {
+  // Initialize with default metadata
+  const metadata = {
+    source: fileName,
+    chunk_type: 'general',
+  };
   
-  // Simple and efficient chunking by fixed size
-  for (let i = 0; i < cleanedText.length; i += chunkSize) {
-    const chunk = cleanedText.substring(i, i + chunkSize).trim();
-    if (chunk.length > 0) chunks.push(chunk);
+  // Extract course code if present
+  const courseCodeMatch = chunk.match(/\b([A-Z]{2,4})\s+(\d{1,3}[A-Z]?)\b/);
+  if (courseCodeMatch) {
+    metadata.course_code = courseCodeMatch[0];
+    metadata.department_code = courseCodeMatch[1];
+    metadata.course_number = courseCodeMatch[2];
   }
   
-  return chunks;
+  // Extract course title if present
+  const titleMatch = chunk.match(/(?::|^)\s*(.*?)\s*(?:\(|$)/);
+  if (titleMatch && titleMatch[1].length > 0 && titleMatch[1].length < 100) {
+    metadata.title = titleMatch[1].trim();
+  }
+  
+  // Extract credits if present
+  const creditsMatch = chunk.match(/\((\d+(?:\.\d+)?)\s*(?:units|credits)\)/i);
+  if (creditsMatch) {
+    metadata.credits = parseFloat(creditsMatch[1]);
+  }
+  
+  // Check for prerequisites
+  if (chunk.toLowerCase().includes('prerequisite')) {
+    metadata.has_prerequisites = true;
+  }
+  
+  return metadata;
+}
+
+// Split text into semantic chunks
+function splitIntoSemanticChunks(text, fileName) {
+  // Clean the text first
+  const cleanedText = cleanText(text);
+  
+  // Define patterns for semantic boundaries
+  const coursePattern = /\b[A-Z]{2,4}\s+\d{1,3}[A-Z]?\.?\s+[^.]+\.\s+/g;
+  const sectionPattern = /(?:\n|\r\n)(?:[A-Z][a-z]+\s+)+(?:Requirements|Information|Policy|Courses|Program|Major|Minor|Concentration)/g;
+  const bulletinPattern = /(?:\n|\r\n)[\s•\-*]+([A-Z])/g;
+  
+  // Combine patterns to find all potential split points
+  const combinedPattern = new RegExp(`(${coursePattern.source}|${sectionPattern.source}|${bulletinPattern.source})`, 'g');
+  
+  // Split text at the identified points
+  let chunks = [];
+  let lastIndex = 0;
+  let match;
+  
+  // Use the combined pattern to find split points
+  const regex = new RegExp(combinedPattern);
+  while ((match = regex.exec(cleanedText)) !== null) {
+    // If we have a substantial amount of text since the last split
+    if (match.index - lastIndex > 50) {
+      const chunk = cleanedText.substring(lastIndex, match.index).trim();
+      if (chunk.length > 0) {
+        chunks.push(chunk);
+      }
+    }
+    lastIndex = match.index;
+  }
+  
+  // Add the final chunk
+  if (lastIndex < cleanedText.length) {
+    const finalChunk = cleanedText.substring(lastIndex).trim();
+    if (finalChunk.length > 0) {
+      chunks.push(finalChunk);
+    }
+  }
+  
+  // Filter out chunks that are too small and merge adjacent small chunks
+  const minChunkSize = 100;
+  const maxChunkSize = 2000;
+  const processedChunks = [];
+  let currentChunk = '';
+  
+  for (const chunk of chunks) {
+    if (currentChunk.length + chunk.length <= maxChunkSize) {
+      currentChunk += (currentChunk ? ' ' : '') + chunk;
+    } else {
+      if (currentChunk.length >= minChunkSize) {
+        processedChunks.push(currentChunk);
+      }
+      currentChunk = chunk;
+    }
+  }
+  
+  if (currentChunk.length >= minChunkSize) {
+    processedChunks.push(currentChunk);
+  }
+  
+  // Create the final chunks with metadata
+  return processedChunks.map(chunk => {
+    return {
+      text: chunk,
+      metadata: extractMetadata(chunk, fileName)
+    };
+  });
 }
 
 // Process a single file
@@ -57,22 +147,22 @@ async function processFile(filePath, collection, fileIndex, totalFiles) {
   
   try {
     const content = fs.readFileSync(filePath, 'utf-8');
-    const chunks = splitIntoChunks(content, CHUNK_SIZE);
+    const semanticChunks = splitIntoSemanticChunks(content, fileName);
     
     let successful = 0;
     let failed = 0;
     
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
+    for (let i = 0; i < semanticChunks.length; i++) {
+      const { text, metadata } = semanticChunks[i];
       const id = `${fileName.replace('.txt', '')}_${i}`;
       
       try {
-        const embedding = await getEmbedding(chunk);
+        const embedding = await getEmbedding(text);
         await collection.add({
           ids: [id],
           embeddings: [embedding],
-          metadatas: [{ source: fileName }],
-          documents: [chunk]
+          metadatas: [metadata],
+          documents: [text]
         });
         
         process.stdout.write(".");
@@ -81,19 +171,20 @@ async function processFile(filePath, collection, fileIndex, totalFiles) {
       } catch (error) {
         process.stdout.write("x");
         failed++;
+        console.error(`\nChunk error: ${error.message.substring(0, 100)}...`);
       }
       
       // Minimal progress reporting
       if ((i + 1) % 20 === 0) {
-        process.stdout.write(`[${i+1}/${chunks.length}]`);
+        process.stdout.write(`[${i+1}/${semanticChunks.length}]`);
       }
     }
     
-    console.log(`\nFile ${fileName}: ${successful}/${chunks.length} chunks added`);
-    return { successful, failed };
+    console.log(`\nFile ${fileName}: ${successful}/${semanticChunks.length} chunks added`);
+    return { successful, failed, totalChunks: semanticChunks.length };
   } catch (error) {
     console.error(`Error with file ${fileName}: ${error.message}`);
-    return { successful: 0, failed: 0 };
+    return { successful: 0, failed: 0, totalChunks: 0 };
   }
 }
 
@@ -109,7 +200,7 @@ async function processFileBatch(fileBatch, collection, startIndex, totalFiles) {
 
 // Main function
 async function vectorizeFiles() {
-  console.log('Starting optimized vectorization...');
+  console.log('Starting semantic vectorization...');
   
   // Connect to ChromaDB
   const client = new ChromaClient({ path: CHROMA_URL });
@@ -135,6 +226,7 @@ async function vectorizeFiles() {
   // Process files in batches
   let totalSuccessful = 0;
   let totalFailed = 0;
+  let totalChunks = 0;
   
   for (let i = 0; i < txtFiles.length; i += CONCURRENT_FILES) {
     const fileBatch = txtFiles.slice(i, i + CONCURRENT_FILES);
@@ -145,12 +237,34 @@ async function vectorizeFiles() {
     results.forEach(result => {
       totalSuccessful += result.successful;
       totalFailed += result.failed;
+      totalChunks += result.totalChunks;
     });
     
-    console.log(`Overall: ${totalSuccessful} successful, ${totalFailed} failed (${Math.round((i + fileBatch.length)/txtFiles.length*100)}% complete)`);
+    console.log(`Overall: ${totalSuccessful}/${totalChunks} chunks successful (${Math.round((i + fileBatch.length)/txtFiles.length*100)}% files complete)`);
   }
   
-  console.log(`\nVectorization complete: ${totalSuccessful} chunks added, ${totalFailed} failed`);
+  console.log(`\nVectorization complete: ${totalSuccessful}/${totalChunks} chunks added, ${totalFailed} failed`);
+  
+  // Print metadata statistics
+  console.log('\nRunning query to check metadata extraction quality...');
+  try {
+    const sampleQuery = await collection.query({
+      queryTexts: ["course information"],
+      nResults: 5
+    });
+    
+    console.log('Sample document metadata:');
+    if (sampleQuery.metadatas && sampleQuery.metadatas[0]) {
+      sampleQuery.metadatas[0].forEach((metadata, i) => {
+        console.log(`\nDocument ${i+1}:`);
+        Object.entries(metadata).forEach(([key, value]) => {
+          console.log(`  ${key}: ${value}`);
+        });
+      });
+    }
+  } catch (error) {
+    console.error('Error running sample query:', error.message);
+  }
 }
 
 // Run the process
